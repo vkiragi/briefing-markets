@@ -386,6 +386,13 @@ PORTFOLIO_DIR      = Path.home() / ".stock_dashboard"
 PORTFOLIOS_DIR     = PORTFOLIO_DIR / "portfolios"
 LEGACY_SINGLE_FILE = PORTFOLIO_DIR / "portfolio.csv"   # pre-multi-account file
 PROFILE_FILE       = PORTFOLIO_DIR / "profile.json"
+SETTINGS_FILE      = PORTFOLIO_DIR / "settings.json"
+
+# Default UI labels (overridable via settings.json — see load_settings)
+DEFAULT_OWNER_LABELS = {
+    "mine": "My Portfolio",
+    "moms": "Mom's Portfolio",
+}
 COMBINED_KEY       = "__combined__"  # sentinel for the aggregated view
 
 
@@ -579,6 +586,29 @@ def save_profile(p: dict) -> None:
     import json
     PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
     PROFILE_FILE.write_text(json.dumps(p, indent=2))
+
+
+def load_settings() -> dict:
+    """Load UI settings (currently just per-owner display labels)."""
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        import json
+        return json.loads(SETTINGS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_settings(s: dict) -> None:
+    import json
+    PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+
+
+def get_owner_label(owner_key: str) -> str:
+    """Display label for an owner — user-overridable via settings.json."""
+    labels = (load_settings().get("owner_labels") or {})
+    return labels.get(owner_key) or DEFAULT_OWNER_LABELS.get(owner_key, owner_key)
 
 
 def format_profile_for_ai(p: dict) -> str:
@@ -1197,8 +1227,10 @@ ticker = st.session_state.ticker
 # Tabs: single-stock view + portfolio view
 # ============================================================
 
+mine_label = get_owner_label("mine")
+moms_label = get_owner_label("moms")
 tab_stock, tab_mine, tab_moms, tab_market = st.tabs(
-    ["📊 Single Stock", "💼 My Portfolio", "👩 Mom's Portfolio", "🌍 Market Today"]
+    ["📊 Single Stock", f"💼 {mine_label}", f"👥 {moms_label}", "🌍 Market Today"]
 )
 
 with tab_stock:
@@ -1907,6 +1939,33 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
     # Manage
     st.divider()
     with st.expander(f"⚙️ Manage {owner_label}"):
+        # "mine" is reserved as the user's own portfolio — only the second tab
+        # can be renamed (e.g. for a partner, parent, or shared account).
+        if owner_key != "mine":
+            with st.form(f"rename_form_{owner_key}", clear_on_submit=False):
+                new_label = st.text_input(
+                    "Portfolio name",
+                    value=owner_label,
+                    help="Shown on the tab and throughout this portfolio's UI. "
+                         "Saved to settings.json.",
+                )
+                if st.form_submit_button("Save name"):
+                    new_label = new_label.strip()
+                    if not new_label:
+                        st.error("Name can't be empty.")
+                    elif new_label != owner_label:
+                        settings = load_settings()
+                        labels = dict(settings.get("owner_labels") or {})
+                        labels[owner_key] = new_label
+                        settings["owner_labels"] = labels
+                        save_settings(settings)
+                        # Invalidate any cached AI output that referenced the old label
+                        st.session_state.pop(sess_review_key, None)
+                        st.session_state.pop(sess_chat_key, None)
+                        st.success(f"Renamed to “{new_label}”.")
+                        st.rerun()
+            st.divider()
+
         confirm = st.checkbox(
             f"Yes, I want to delete the saved CSV for {owner_label}",
             key=f"confirm_del_{owner_key}",
@@ -1924,10 +1983,10 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
 
 
 with tab_mine:
-    render_portfolio_tab("mine", "My Portfolio")
+    render_portfolio_tab("mine", mine_label)
 
 with tab_moms:
-    render_portfolio_tab("moms", "Mom's Portfolio")
+    render_portfolio_tab("moms", moms_label)
 
 
 with tab_market:
