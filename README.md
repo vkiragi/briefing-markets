@@ -60,7 +60,9 @@ All personal state lives in `~/.stock_dashboard/` — never committed to the rep
 │   └── moms.csv          # second tab — rename from the UI
 ├── strategy/             # goals, watchlist, theses per portfolio
 │   └── mine.json
-└── chats/                # persisted chat histories
+├── chats/                # persisted chat histories
+└── ai_cache/             # cached AI briefings/reviews — survives reloads.
+                          # Click "Refresh" on any AI block to regenerate.
 ```
 
 ## Renaming the second portfolio

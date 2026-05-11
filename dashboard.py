@@ -481,6 +481,50 @@ def combine_portfolios(per_account: dict) -> tuple[pd.DataFrame, dict, float]:
 
 CHATS_DIR    = PORTFOLIO_DIR / "chats"
 STRATEGY_DIR = PORTFOLIO_DIR / "strategy"
+AI_CACHE_DIR = PORTFOLIO_DIR / "ai_cache"
+
+
+def _ai_cache_path(key: str) -> Path:
+    """Sanitized filesystem path for a cached AI output."""
+    safe = _re.sub(r"[^A-Za-z0-9_-]+", "_", key)[:120] or "cache"
+    return AI_CACHE_DIR / f"{safe}.txt"
+
+
+def load_ai_cache(key: str) -> str | None:
+    """Read a cached AI output from disk. Returns None if missing/corrupt."""
+    path = _ai_cache_path(key)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text()
+    except Exception:
+        return None
+
+
+def save_ai_cache(key: str, value: str) -> None:
+    AI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _ai_cache_path(key).write_text(value)
+
+
+def invalidate_ai_cache(key: str) -> None:
+    """Clear both the in-memory and on-disk copies of a cached AI output."""
+    st.session_state.pop(key, None)
+    _ai_cache_path(key).unlink(missing_ok=True)
+
+
+def get_or_cache_ai(key: str, generator) -> str:
+    """Standard read-through cache for AI outputs: session_state → disk → generate.
+    `generator` is a zero-arg callable that produces the value when both caches miss."""
+    if key in st.session_state:
+        return st.session_state[key]
+    cached = load_ai_cache(key)
+    if cached is not None:
+        st.session_state[key] = cached
+        return cached
+    value = generator()
+    st.session_state[key] = value
+    save_ai_cache(key, value)
+    return value
 
 
 def load_strategy(owner_key: str) -> dict:
@@ -1410,12 +1454,16 @@ with tab_stock:
             refresh_b = st.button("Refresh", key="refresh_brief", use_container_width=True)
 
         cache_b = f"brief_{ticker}"
-        if refresh_b or cache_b not in st.session_state:
-            with st.spinner("Reading the news…"):
-                st.session_state[cache_b] = ai_news_briefing(ticker, profile, quote, news)
+        if refresh_b:
+            invalidate_ai_cache(cache_b)
+        with st.spinner("Reading the news…"):
+            briefing_text = get_or_cache_ai(
+                cache_b,
+                lambda: ai_news_briefing(ticker, profile, quote, news),
+            )
         with bcol:
             st.caption("✨ AI generated")
-            st.markdown(st.session_state[cache_b].replace("$", "\\$"))
+            st.markdown(briefing_text.replace("$", "\\$"))
 
         st.markdown("")  # spacer
 
@@ -1426,12 +1474,16 @@ with tab_stock:
             refresh_t = st.button("Refresh", key="refresh_ta", use_container_width=True)
 
         cache_t = f"ta_{ticker}_{period}"
-        if refresh_t or cache_t not in st.session_state:
-            with st.spinner("Reading the chart…"):
-                st.session_state[cache_t] = ai_technical_analysis(ticker, profile, ind)
+        if refresh_t:
+            invalidate_ai_cache(cache_t)
+        with st.spinner("Reading the chart…"):
+            ta_text = get_or_cache_ai(
+                cache_t,
+                lambda: ai_technical_analysis(ticker, profile, ind),
+            )
         with tcol:
             st.caption("✨ AI generated")
-            st.markdown(st.session_state[cache_t].replace("$", "\\$"))
+            st.markdown(ta_text.replace("$", "\\$"))
 
     st.divider()
 
@@ -1574,10 +1626,20 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
                     }
                     save_profile(new_profile)
                     st.session_state.profile = new_profile
-                    # Invalidate cached AI outputs across both portfolios
+                    # Invalidate cached AI outputs that depend on the profile:
+                    # portfolio reviews/chats (both in-memory and on-disk) and
+                    # any stock-tab briefings/TA in session_state.
                     for k in list(st.session_state.keys()):
-                        if k.startswith("portfolio_review_") or k.startswith("portfolio_chat_"):
+                        if k.startswith(("portfolio_review_", "portfolio_chat_",
+                                         "brief_", "ta_")):
                             st.session_state.pop(k, None)
+                    if AI_CACHE_DIR.exists():
+                        for f in AI_CACHE_DIR.glob("portfolio_review_*.txt"):
+                            f.unlink(missing_ok=True)
+                        for f in AI_CACHE_DIR.glob("brief_*.txt"):
+                            f.unlink(missing_ok=True)
+                        for f in AI_CACHE_DIR.glob("ta_*.txt"):
+                            f.unlink(missing_ok=True)
                     st.success("Profile saved. AI outputs will refresh.")
                     st.rerun()
 
@@ -1628,7 +1690,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
                     "holdings": h, "totals": t, "cash": c,
                     "source": f"uploaded · saved to {csv_path.name}",
                 }
-                st.session_state.pop(sess_review_key, None)
+                invalidate_ai_cache(sess_review_key)
                 st.session_state.pop(sess_chat_key, None)
                 st.success(f"Positions saved as {csv_path.name}.")
                 st.rerun()
@@ -1730,7 +1792,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
                 "target": target, "years": years, "annual_return_pct": annual_return,
             }
             save_strategy(owner_key, strategy)
-            st.session_state.pop(sess_review_key, None)
+            invalidate_ai_cache(sess_review_key)
             st.success("Goal saved.")
             st.rerun()
 
@@ -1781,7 +1843,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
                     watchlist.pop(i)
                     strategy["watchlist"] = watchlist
                     save_strategy(owner_key, strategy)
-                    st.session_state.pop(sess_review_key, None)
+                    invalidate_ai_cache(sess_review_key)
                     st.rerun()
         else:
             st.caption("Empty. Add a ticker below.")
@@ -1800,7 +1862,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
                 watchlist.append({"symbol": new_sym, "note": new_note.strip()})
                 strategy["watchlist"] = watchlist
                 save_strategy(owner_key, strategy)
-                st.session_state.pop(sess_review_key, None)
+                invalidate_ai_cache(sess_review_key)
                 st.rerun()
 
     with st.expander("📝 Theses (why you own each)", expanded=False):
@@ -1820,7 +1882,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
             if st.form_submit_button("Save theses", use_container_width=True):
                 strategy["theses"] = {k: v.strip() for k, v in edited.items() if v.strip()}
                 save_strategy(owner_key, strategy)
-                st.session_state.pop(sess_review_key, None)
+                invalidate_ai_cache(sess_review_key)
                 st.success("Theses saved.")
                 st.rerun()
 
@@ -1860,15 +1922,19 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
     rcol, rbtn = st.columns([5, 1])
     with rbtn:
         refresh_p = st.button("Refresh", key=f"refresh_review_{owner_key}", use_container_width=True)
-    if refresh_p or sess_review_key not in st.session_state:
-        with st.spinner("Claude is reviewing this portfolio…"):
-            st.session_state[sess_review_key] = ai_portfolio_review(
+    if refresh_p:
+        invalidate_ai_cache(sess_review_key)
+    with st.spinner("Claude is reviewing this portfolio…"):
+        review_text = get_or_cache_ai(
+            sess_review_key,
+            lambda: ai_portfolio_review(
                 holdings, p_totals, cash, sectors,
                 profile=st.session_state.get("profile") or load_profile(),
                 strategy=load_strategy(owner_key),
-            )
+            ),
+        )
     with rcol:
-        st.markdown(st.session_state[sess_review_key].replace("$", "\\$"))
+        st.markdown(review_text.replace("$", "\\$"))
 
     # Chat
     st.divider()
@@ -1960,7 +2026,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
                         settings["owner_labels"] = labels
                         save_settings(settings)
                         # Invalidate any cached AI output that referenced the old label
-                        st.session_state.pop(sess_review_key, None)
+                        invalidate_ai_cache(sess_review_key)
                         st.session_state.pop(sess_chat_key, None)
                         st.success(f"Renamed to “{new_label}”.")
                         st.rerun()
@@ -1976,7 +2042,7 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
             except Exception as e:
                 st.error(f"Couldn't delete file: {e}")
             st.session_state.pop(sess_data_key, None)
-            st.session_state.pop(sess_review_key, None)
+            invalidate_ai_cache(sess_review_key)
             st.session_state.pop(sess_chat_key, None)
             save_chat(f"portfolio_{owner_key}", [])  # also delete persisted chat
             st.rerun()
@@ -2025,13 +2091,17 @@ with tab_market:
         refresh_m = st.button("Refresh", key="refresh_market", use_container_width=True)
 
     cache_m = "market_briefing"
-    if refresh_m or cache_m not in st.session_state:
-        with st.spinner("Claude is reading the news…"):
-            st.session_state[cache_m] = ai_market_briefing(
+    if refresh_m:
+        invalidate_ai_cache(cache_m)
+    with st.spinner("Claude is reading the news…"):
+        market_text = get_or_cache_ai(
+            cache_m,
+            lambda: ai_market_briefing(
                 market_news, earnings_week, portfolio_tickers,
-            )
+            ),
+        )
     with mcol1:
-        st.markdown(st.session_state[cache_m].replace("$", "\\$"))
+        st.markdown(market_text.replace("$", "\\$"))
 
     st.divider()
 
