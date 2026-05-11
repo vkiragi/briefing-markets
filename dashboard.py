@@ -1273,8 +1273,9 @@ ticker = st.session_state.ticker
 
 mine_label = get_owner_label("mine")
 moms_label = get_owner_label("moms")
-tab_stock, tab_mine, tab_moms, tab_market = st.tabs(
-    ["📊 Single Stock", f"💼 {mine_label}", f"👥 {moms_label}", "🌍 Market Today"]
+tab_stock, tab_mine, tab_moms, tab_combined, tab_market = st.tabs(
+    ["📊 Single Stock", f"💼 {mine_label}", f"👥 {moms_label}",
+     "🧮 Combined", "🌍 Market Today"]
 )
 
 with tab_stock:
@@ -2048,11 +2049,214 @@ def render_portfolio_tab(owner_key: str, owner_label: str):
             st.rerun()
 
 
+def render_combined_portfolio_tab(per_owner_labels: dict[str, str]):
+    """Aggregated read-only view across all configured portfolios. Holdings are
+    summed by symbol via combine_portfolios(); allocation, AI review, and chat
+    operate on the merged book. Per-owner strategy (goal/watchlist) is skipped —
+    only theses are merged in so the AI has thesis context."""
+    sess_review_key = f"portfolio_review_{COMBINED_KEY}"
+    sess_chat_key   = f"portfolio_chat_{COMBINED_KEY}"
+
+    st.subheader("🧮 Combined portfolio")
+    st.caption(
+        "Roll-up of every portfolio you've uploaded. Shares and dollars are summed "
+        "per ticker; allocation and AI review run on the merged book."
+    )
+
+    # Collect parsed portfolios from session state (populated by the per-owner tabs).
+    per_account: dict[str, dict] = {}
+    missing: list[str] = []
+    for owner_key, label in per_owner_labels.items():
+        p = st.session_state.get(f"portfolio_{owner_key}")
+        if p and not p["holdings"].empty:
+            per_account[label] = p
+        else:
+            missing.append(label)
+
+    if not per_account:
+        st.info("👆 Upload at least one Positions CSV in one of the portfolio tabs to see the combined view.")
+        return
+    if missing:
+        st.caption(f"⚠️ Not included (no CSV uploaded): {', '.join(missing)}.")
+
+    holdings, p_totals, cash = combine_portfolios(per_account)
+    if holdings.empty:
+        st.info("Nothing to show — combined holdings came out empty.")
+        return
+
+    bits = [f"📂 {len(per_account)} portfolios", f"{len(holdings)} unique holdings",
+            f"${cash:,.2f} cash"]
+    st.caption(" · ".join(bits))
+
+    # Top metrics
+    total_mv = p_totals["market_value"]
+    total_cb = p_totals["cost_basis"]
+    total_g  = p_totals["gain_$"]
+    total_gp = p_totals["gain_%"]
+    day_d    = p_totals["day_change_$"]
+    day_p    = p_totals["day_change_%"]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total value", f"${total_mv:,.2f}", f"{day_d:+,.2f} ({day_p:+.2f}%) today")
+    m2.metric("Cost basis", f"${total_cb:,.2f}")
+    m3.metric("Total gain", f"${total_g:+,.2f}", f"{total_gp:+.2f}%")
+    m4.metric("Holdings", f"{len(holdings)}")
+
+    st.divider()
+
+    # Holdings table
+    st.subheader("Holdings")
+    display = holdings.copy()
+    display["market_value"]  = display["market_value"].apply(lambda v: f"${v:,.2f}")
+    display["cost_basis"]    = display["cost_basis"].apply(lambda v: f"${v:,.2f}" if v else "—")
+    display["price"]         = display["price"].apply(lambda v: f"${v:,.2f}")
+    display["gain_$"]        = display["gain_$"].apply(lambda v: f"${v:+,.2f}" if v is not None else "—")
+    display["gain_%"]        = display["gain_%"].apply(lambda v: f"{v:+.2f}%" if v is not None else "—")
+    display["day_change_$"]  = display["day_change_$"].apply(lambda v: f"${v:+,.2f}" if v is not None else "—")
+    display["day_change_%"]  = display["day_change_%"].apply(lambda v: f"{v:+.2f}%" if v is not None else "—")
+    display["pct_of_acct"]   = display["pct_of_acct"].apply(lambda v: f"{v:.1f}%" if v is not None else "—")
+    display.columns = ["Symbol", "Name", "Shares", "Price", "Mkt Value", "Day $",
+                       "Day %", "Cost Basis", "Gain $", "Gain %", "% Acct", "Type"]
+    st.table(display.set_index("Symbol"))
+
+    st.divider()
+
+    # Allocation pies
+    st.subheader("Allocation")
+    acol1, acol2 = st.columns(2)
+    with acol1:
+        st.caption("By holding")
+        fig_h = go.Figure(data=[go.Pie(
+            labels=holdings["symbol"], values=holdings["market_value"],
+            hole=0.4, textinfo="label+percent",
+        )])
+        fig_h.update_layout(height=350, margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
+        st.plotly_chart(fig_h, use_container_width=True, config={"displayModeBar": False})
+
+    with st.spinner("Looking up sectors…"):
+        sectors = fetch_sectors(tuple(holdings["symbol"].tolist()))
+
+    with acol2:
+        st.caption("By sector")
+        sec_df = holdings.assign(sector=holdings["symbol"].map(sectors)) \
+            .groupby("sector", as_index=False)["market_value"].sum()
+        fig_s = go.Figure(data=[go.Pie(
+            labels=sec_df["sector"], values=sec_df["market_value"],
+            hole=0.4, textinfo="label+percent",
+        )])
+        fig_s.update_layout(height=350, margin=dict(l=0, r=0, t=0, b=0), showlegend=False)
+        st.plotly_chart(fig_s, use_container_width=True, config={"displayModeBar": False})
+
+    st.divider()
+
+    # Merge theses from every included portfolio so AI has context.
+    # Goal/watchlist are inherently per-owner — leave them out.
+    merged_theses: dict[str, str] = {}
+    held_syms = set(holdings["symbol"])
+    for owner_key, label in per_owner_labels.items():
+        if label not in per_account:
+            continue
+        for sym, t in (load_strategy(owner_key).get("theses") or {}).items():
+            if sym in held_syms and t and sym not in merged_theses:
+                merged_theses[sym] = t
+    combined_strategy = {"goal": {}, "watchlist": [], "theses": merged_theses}
+
+    # AI review
+    st.subheader("🤖 AI portfolio review · Combined")
+    st.caption("✨ AI generated · using merged holdings across all portfolios")
+    rcol, rbtn = st.columns([5, 1])
+    with rbtn:
+        refresh_p = st.button("Refresh", key=f"refresh_review_{COMBINED_KEY}", use_container_width=True)
+    if refresh_p:
+        invalidate_ai_cache(sess_review_key)
+    with st.spinner("Claude is reviewing the combined portfolio…"):
+        review_text = get_or_cache_ai(
+            sess_review_key,
+            lambda: ai_portfolio_review(
+                holdings, p_totals, cash, sectors,
+                profile=st.session_state.get("profile") or load_profile(),
+                strategy=combined_strategy,
+            ),
+        )
+    with rcol:
+        st.markdown(review_text.replace("$", "\\$"))
+
+    # Chat
+    st.divider()
+    st.subheader("💬 Ask follow-up questions")
+    st.caption("✨ AI generated · context: combined portfolio")
+
+    if sess_chat_key not in st.session_state:
+        st.session_state[sess_chat_key] = load_chat(f"portfolio_{COMBINED_KEY}")
+
+    if not st.session_state[sess_chat_key]:
+        st.caption("Try:")
+        samples = [
+            "What's the biggest concentration risk across the combined book?",
+            "Where do the two portfolios overlap, and where do they diverge?",
+            "How does the combined sector tilt compare to the S&P 500?",
+        ]
+        scols = st.columns(len(samples))
+        for i, (col, s) in enumerate(zip(scols, samples)):
+            if col.button(s, key=f"sample_{COMBINED_KEY}_{i}", use_container_width=True):
+                st.session_state[f"_pending_chat_{COMBINED_KEY}"] = s
+                st.rerun()
+
+    for msg in st.session_state[sess_chat_key]:
+        icon = "🧑" if msg["role"] == "user" else "🤖"
+        label = "You" if msg["role"] == "user" else "Claude"
+        st.markdown(f"**{icon} {label}**")
+        st.markdown(msg["content"].replace("$", "\\$"))
+        st.markdown("---")
+
+    with st.form(f"chat_form_{COMBINED_KEY}", clear_on_submit=True):
+        p_q = st.text_input(
+            "Ask a question",
+            placeholder="e.g. which position is the biggest combined risk?",
+            label_visibility="collapsed",
+        )
+        p_submit = st.form_submit_button("Send", use_container_width=True)
+
+    p_pending = st.session_state.pop(f"_pending_chat_{COMBINED_KEY}", None)
+    p_question = (p_q.strip() if p_submit and p_q else None) or p_pending
+
+    if p_question:
+        st.session_state[sess_chat_key].append({"role": "user", "content": p_question})
+        p_system = build_portfolio_chat_context(
+            holdings, p_totals, cash, sectors,
+            review=st.session_state.get(sess_review_key),
+            profile=st.session_state.get("profile") or load_profile(),
+            strategy=combined_strategy,
+        )
+        included = ", ".join(per_account.keys())
+        p_system = (
+            "NOTE: This is the COMBINED view across multiple portfolios the user manages "
+            f"({included}). Holdings are summed per ticker. When advising, treat the user "
+            "as the decision-maker for all of them, but note when advice would differ by "
+            "account (e.g. tax-loss harvesting in a taxable account vs. an IRA).\n\n"
+        ) + p_system
+        p_history = st.session_state[sess_chat_key][-20:]
+        with st.spinner("Thinking…"):
+            p_answer = call_claude_messages(p_history, max_tokens=700, system=p_system)
+        st.session_state[sess_chat_key].append({"role": "assistant", "content": p_answer})
+        save_chat(f"portfolio_{COMBINED_KEY}", st.session_state[sess_chat_key])
+        st.rerun()
+
+    if st.session_state[sess_chat_key]:
+        if st.button("Clear chat", key=f"clear_chat_{COMBINED_KEY}"):
+            st.session_state[sess_chat_key] = []
+            save_chat(f"portfolio_{COMBINED_KEY}", [])
+            st.rerun()
+
+
 with tab_mine:
     render_portfolio_tab("mine", mine_label)
 
 with tab_moms:
     render_portfolio_tab("moms", moms_label)
+
+with tab_combined:
+    render_combined_portfolio_tab({"mine": mine_label, "moms": moms_label})
 
 
 with tab_market:
